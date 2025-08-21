@@ -44,3 +44,90 @@ jobs:
           ignore-unfixed: true
           vuln-type: "os,library"
           severity: "CRITICAL,HIGH,MEDIUM,LOW,UNKNOWN"
+
+  app-level-patch:
+    name: App-level vulnerability patching for TFS dependencies
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build dependencies target
+        run: |
+          docker buildx build \
+            --file docker/presets/models/tfs/Dockerfile \
+            --target dependencies \
+            --tag tfs-dependencies:latest \
+            --build-arg MODEL_TYPE=tfs \
+            --build-arg VERSION=test \
+            --load \
+            .
+
+      - name: Run Trivy vulnerability scanner for app-level vulnerabilities
+        uses: aquasecurity/trivy-action@dc5a429b52fcf669ce959baa2c2dd26090d2a6c4 # v0.32.0
+        with:
+          image-ref: tfs-dependencies:latest
+          format: "json"
+          output: "trivy-report.json"
+          exit-code: "0"
+          vuln-type: "library"
+          severity: "CRITICAL,HIGH,MEDIUM,LOW,UNKNOWN"
+
+      - name: Display Trivy results
+        run: |
+          echo "=== App-level vulnerabilities found ==="
+          cat trivy-report.json | jq -r '.Results[].Vulnerabilities[] | "\(.PkgName) \(.InstalledVersion) -> \(.FixedVersion) (\(.Severity))"' 2>/dev/null || echo "No vulnerabilities found or unable to parse report"
+
+      - name: Install Copa
+        run: |
+          # Install Copa from the latest release
+          COPA_VERSION=$(curl -s https://api.github.com/repos/project-copacetic/copacetic/releases/latest | jq -r .tag_name | sed 's/v//')
+          curl -L https://github.com/project-copacetic/copacetic/releases/download/v${COPA_VERSION}/copa_${COPA_VERSION}_linux_amd64.tar.gz | tar -xz
+          sudo mv copa /usr/local/bin/
+          copa --version
+
+      - name: Start BuildKit daemon
+        run: |
+          docker run \
+            --detach \
+            --rm \
+            --privileged \
+            --name buildkitd \
+            --entrypoint buildkitd \
+            moby/buildkit:latest
+
+      - name: Patch image with Copa (app-level)
+        env:
+          COPA_EXPERIMENTAL: "1"
+        run: |
+          export BUILDKIT_HOST=docker-container://buildkitd
+          copa patch \
+            --image tfs-dependencies:latest \
+            --report trivy-report.json \
+            --tag tfs-dependencies-patched:latest \
+            --pkg-types library \
+            --library-patch-level patch \
+            --addr docker-container://buildkitd
+          
+      - name: Verify patched image
+        run: |
+          echo "=== Verifying patched image ==="
+          docker run --rm tfs-dependencies-patched:latest python -c "import sys; print(f'Python {sys.version}')"
+          docker run --rm tfs-dependencies-patched:latest pip list
+
+      - name: Re-scan patched image
+        uses: aquasecurity/trivy-action@dc5a429b52fcf669ce959baa2c2dd26090d2a6c4 # v0.32.0
+        with:
+          image-ref: tfs-dependencies-patched:latest
+          format: "table"
+          exit-code: "0"
+          vuln-type: "library"
+          severity: "CRITICAL,HIGH,MEDIUM,LOW,UNKNOWN"
+
+      - name: Clean up BuildKit daemon
+        if: always()
+        run: |
+          docker stop buildkitd || true
